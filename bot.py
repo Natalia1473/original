@@ -2,6 +2,8 @@ import logging
 import sqlite3
 import os
 import tempfile
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from difflib import SequenceMatcher
 
@@ -9,7 +11,6 @@ from dotenv import load_dotenv
 from telegram import Update, Bot
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
 from flask import Flask, request
-from docx import Document  # pip install python-docx
 
 # --------------- ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---------------
 load_dotenv()  # ищет .env в корне проекта
@@ -73,11 +74,29 @@ def calculate_max_similarity(new_text: str):
             best_user = rec_username or str(rec_user_id)
     return best_ratio, best_id, best_user
 
-# ------------- ФУНКЦИЯ ДЛЯ ЧТЕНИЯ .docx -------------
+# ------------- ФУНКЦИЯ ДЛЯ ЧТЕНИЯ .docx (без python-docx) -------------
 def extract_text_from_docx(path: str) -> str:
-    doc = Document(path)
-    paragraphs = [p.text for p in doc.paragraphs if p.text]
-    return "\n".join(paragraphs)
+    """
+    Извлекает текст из DOCX, читая только XML document.xml и игнорируя медиа.
+    Это избавляет от ошибок CRC-32 на поврежденных картинках.
+    """
+    try:
+        with zipfile.ZipFile(path, 'r') as z:
+            xml_content = z.read('word/document.xml')
+    except Exception as e:
+        raise RuntimeError(f"Ошибка при открытии DOCX как ZIP: {e}")
+
+    # Парсим XML и собираем все <w:t> элементы (текстовые узлы)
+    try:
+        namespace = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+        root = ET.fromstring(xml_content)
+        texts = []
+        for node in root.findall('.//w:t', namespace):
+            if node.text:
+                texts.append(node.text)
+        return "\n".join(texts)
+    except Exception as e:
+        raise RuntimeError(f"Ошибка при разборе XML document.xml: {e}")
 
 # ------------- ОБРАБОТЧИКИ СООБЩЕНИЙ -------------
 def start(update: Update, context):
@@ -88,9 +107,9 @@ def start(update: Update, context):
 
 def help_cmd(update: Update, context):
     update.message.reply_text(
-        "/start — приветствие\n"
-        "/help — справка\n\n"
-        "Отправь текст или загрузите .docx."
+        "/start — показать приветствие\n"
+        "/help — показать справку\n\n"
+        "Отправь текст или загрузи .docx."
     )
 
 def check_text(update: Update, context):
@@ -123,7 +142,7 @@ def handle_document(update: Update, context):
         update.message.reply_text("Поддерживаются только файлы .docx")
         return
 
-    # Скачиваем в временный файл
+    # Скачиваем файл во временный каталог
     file_id = doc.file_id
     new_file = context.bot.get_file(file_id)
     with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:

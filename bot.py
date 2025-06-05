@@ -1,6 +1,7 @@
 import logging
 import sqlite3
 import os
+import tempfile
 from datetime import datetime
 from difflib import SequenceMatcher
 
@@ -8,14 +9,15 @@ from dotenv import load_dotenv
 from telegram import Update, Bot
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
 from flask import Flask, request
+from docx import Document  # pip install python-docx
 
 # --------------- ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---------------
-load_dotenv()  # ожидает .env в корне проекта
-TOKEN = os.getenv("TELEGRAM_TOKEN")        # токен бота
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")     # HTTPS URL вашего сервиса без слэша в конце, например https://mybot.onrender.com
-PORT = int(os.getenv("PORT", "8443"))      # порт, на котором будет слушать Flask
-DB_PATH = "submissions.db"                 # файл базы данных SQLite
-SIMILARITY_THRESHOLD = 0.7                 # порог похожести (0.7 = 70%)
+load_dotenv()  # ищет .env в корне
+TOKEN = os.getenv("TELEGRAM_TOKEN")         # токен бота
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")      # без слэша в конце, например https://mybot.onrender.com
+PORT = int(os.getenv("PORT", "8443"))       # порт для Flask
+DB_PATH = "submissions.db"                  # SQLite-файл
+SIMILARITY_THRESHOLD = 0.7                  # порог похожести (0.7 = 70%)
 
 # ------------- ЛОГИРОВАНИЕ --------------
 logging.basicConfig(
@@ -57,7 +59,7 @@ def fetch_all_submissions():
 def calculate_max_similarity(new_text: str):
     """
     Возвращает (max_ratio, id_похожей_записи, username_похожей_записи).
-    Если записей нет, вернет (0.0, None, None).
+    Если записей нет, вернёт (0.0, None, None).
     """
     submissions = fetch_all_submissions()
     best_ratio, best_id, best_user = 0.0, None, None
@@ -69,11 +71,17 @@ def calculate_max_similarity(new_text: str):
             best_user = rec_username or str(rec_user_id)
     return best_ratio, best_id, best_user
 
+# ------------- ФУНКЦИИ ДЛЯ ЧТЕНИЯ DOCX -------------
+def extract_text_from_docx(path: str) -> str:
+    doc = Document(path)
+    paragraphs = [p.text for p in doc.paragraphs if p.text]
+    return "\n".join(paragraphs)
+
 # ------------- ОБРАБОТЧИКИ СООБЩЕНИЙ -------------
 def start(update: Update, context):
     update.message.reply_text(
         "Привет! Я бот для проверки оригинальности работ.\n"
-        "Отправь текст работы — я проверю её на схожесть с ранее присланными."
+        "Можно отправить текст как сообщение или загрузить .docx файл."
     )
 
 def help_cmd(update: Update, context):
@@ -101,15 +109,59 @@ def check_text(update: Update, context):
     update.message.reply_text(reply)
     save_submission(user.id, user.username or "", text)
 
+def handle_document(update: Update, context):
+    user = update.effective_user
+    doc = update.message.document
+
+    if not doc.file_name.lower().endswith(".docx"):
+        update.message.reply_text("Поддерживаются только файлы .docx")
+        return
+
+    # Скачиваем файл во временный каталог
+    file_id = doc.file_id
+    new_file = context.bot.get_file(file_id)
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+        new_file.download(custom_path=temp_path)
+
+    # Извлекаем текст
+    try:
+        text = extract_text_from_docx(temp_path)
+    except Exception as e:
+        update.message.reply_text("Не смог прочитать .docx файл.")
+        return
+    finally:
+        os.remove(temp_path)
+
+    if not text.strip():
+        update.message.reply_text("Файл пустой или не содержит текста.")
+        return
+
+    # Проверяем похожесть
+    ratio, matched_id, matched_user = calculate_max_similarity(text)
+    if matched_id and ratio >= SIMILARITY_THRESHOLD:
+        perc = round(ratio * 100, 1)
+        reply = (
+            f"⚠ Похожесть: {perc}%\n"
+            f"Найдена похожая работа пользователя @{matched_user}.\n"
+            "Если ты не списывал(а), просто проигнорируй.\n"
+            "Работа сохранена."
+        )
+    else:
+        reply = "✅ Похоже, что работа оригинальная. Сохраняю."
+
+    update.message.reply_text(reply)
+    save_submission(user.id, user.username or "", text)
+
 # ------------- НАСТРОЙКА BOT и DISPATCHER -------------
 app = Flask(__name__)
 bot = Bot(token=TOKEN)
-# Dispatcher с минимум 1 воркером (например, 4), чтобы не было warning
 dispatcher = Dispatcher(bot, None, workers=4, use_context=True)
 
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CommandHandler("help", help_cmd))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, check_text))
+dispatcher.add_handler(MessageHandler(Filters.document, handle_document))
 
 # ------------- ROUTES ДЛЯ FLASK -------------
 @app.route("/", methods=["GET"])
@@ -127,9 +179,7 @@ def webhook():
 if __name__ == "__main__":
     init_db()
     if not TOKEN or not WEBHOOK_URL:
-        logger.error("TELEGRAM_TOKEN или WEBHOOK_URL не заданы в окружении!")
+        logger.error("TELEGRAM_TOKEN или WEBHOOK_URL не заданы!")
         exit(1)
-    # Устанавливаем webhook
     bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
-    # Запускаем Flask
     app.run(host="0.0.0.0", port=PORT)

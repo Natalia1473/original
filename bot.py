@@ -1,159 +1,113 @@
 import logging
 import sqlite3
-from datetime import datetime
 import os
-
+from datetime import datetime
 from difflib import SequenceMatcher
+
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from telegram import Update, Bot
+from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
+from flask import Flask, request
 
-# --------------- ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---------------
-load_dotenv()  # ищет .env в текущей папке
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+load_dotenv()
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # без слэша в конце, например: https://mybot.onrender.com
+PORT = int(os.getenv("PORT", "8443"))
 DB_PATH = "submissions.db"
-SIMILARITY_THRESHOLD = 0.7  # 70%
+SIMILARITY_THRESHOLD = 0.7
 
-# ------------- ЛОГИРОВАНИЕ --------------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-
-# ------------- ИНИЦИАЛИЗАЦИЯ БД -------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS submissions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             username TEXT,
-            text   TEXT NOT NULL,
-            ts     TEXT NOT NULL
+            text TEXT NOT NULL,
+            ts TEXT NOT NULL
         )
     """)
     conn.commit()
     conn.close()
 
-
-# ------------- ФУНКЦИИ РАБОТЫ С БД -------------
 def save_submission(user_id: int, username: str, text: str):
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
+    conn.execute(
         "INSERT INTO submissions (user_id, username, text, ts) VALUES (?, ?, ?, ?)",
         (user_id, username, text, datetime.utcnow().isoformat())
     )
     conn.commit()
     conn.close()
 
-
 def fetch_all_submissions():
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT id, user_id, username, text, ts FROM submissions")
-    rows = cur.fetchall()
+    rows = conn.execute("SELECT id, user_id, username, text, ts FROM submissions").fetchall()
     conn.close()
-    return rows  # список кортежей (id, user_id, username, text, ts)
+    return rows
 
-
-# ------------- УТИЛИТА: СРАВНЕНИЕ ТЕКСТА -------------
 def calculate_max_similarity(new_text: str):
-    """
-    Возвращает кортеж (max_ratio, id_похожей_записи, username_похожей_записи).
-    Если записей нет, вернёт (0.0, None, None).
-    """
     submissions = fetch_all_submissions()
-    best_ratio = 0.0
-    best_id = None
-    best_username = None
-
-    for rec in submissions:
-        rec_id, rec_user_id, rec_username, rec_text, rec_ts = rec
+    best_ratio, best_id, best_user = 0.0, None, None
+    for rec_id, rec_user_id, rec_username, rec_text, rec_ts in submissions:
         ratio = SequenceMatcher(None, new_text, rec_text).ratio()
         if ratio > best_ratio:
             best_ratio = ratio
             best_id = rec_id
-            best_username = rec_username or str(rec_user_id)
-    return best_ratio, best_id, best_username
+            best_user = rec_username or str(rec_user_id)
+    return best_ratio, best_id, best_user
 
-
-# ------------- ОБРАБОТЧИКИ КОМАНД -------------
-def start_handler(update: Update, context: CallbackContext):
-    text = (
-        "Привет! Я бот для проверки оригинальности работ.\n"
-        "Отправь текст работы целиком (просто как сообщение), "
-        "я проверю степень схожести с ранее присланными и сохраню твою работу."
+def start(update: Update, context):
+    update.message.reply_text(
+        "Привет! Я бот для проверки оригинальности. Отправь текст работы."
     )
-    update.message.reply_text(text)
 
+def help_cmd(update: Update, context):
+    update.message.reply_text("/start   /help")
 
-def help_handler(update: Update, context: CallbackContext):
-    text = (
-        "/start — показать это сообщение\n"
-        "Просто отправь текст работы как обычное сообщение."
-    )
-    update.message.reply_text(text)
-
-
-# ------------- ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ -------------
-def text_handler(update: Update, context: CallbackContext):
+def check_text(update: Update, context):
     user = update.effective_user
-    user_id = user.id
-    username = user.username or ""
     text = update.message.text.strip()
-
     if not text:
-        update.message.reply_text("Пустого текста не принимаю.")
+        update.message.reply_text("Пустой текст не принимаю.")
         return
-
-    # Сначала считаем схожесть с предыдущими работами
-    max_ratio, matched_id, matched_username = calculate_max_similarity(text)
-
-    # Форматируем ответ в зависимости от результата
-    if matched_id is not None and max_ratio >= SIMILARITY_THRESHOLD:
-        perc = round(max_ratio * 100, 1)
+    ratio, matched_id, matched_user = calculate_max_similarity(text)
+    if matched_id and ratio >= SIMILARITY_THRESHOLD:
+        perc = round(ratio * 100, 1)
         reply = (
             f"⚠ Похожесть: {perc}%\n"
-            f"Ближайшее совпадение с работой пользователя @{matched_username}.\n"
-            "Если ты не списывал(а), просто проигнорируй это сообщение.\n"
+            f"Ближайшая работа: @{matched_user}\n"
             "Твоя работа будет сохранена."
         )
     else:
-        reply = "✅ Похоже, что работа оригинальна (нет явных совпадений). Сохраняю её."
-
-    # Отправляем ответ и сохраняем новую работу
+        reply = "✅ Оригинально. Сохраняю."
     update.message.reply_text(reply)
-    save_submission(user_id, username, text)
+    save_submission(user.id, user.username or "", text)
 
+# Flask-приложение для webhook
+app = Flask(__name__)
+bot = Bot(token=TOKEN)
+dispatcher = Dispatcher(bot, None, workers=0)
 
-# ------------- ГЛАВНАЯ ФУНКЦИЯ -------------
-def main():
-    # Инициализируем базу
-    init_db()
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CommandHandler("help", help_cmd))
+dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, check_text))
 
-    # Убедимся, что токен взялся
-    if not TELEGRAM_TOKEN:
-        logger.error("TELEGRAM_TOKEN не найден в окружении!")
-        return
-
-    # Создаём бота
-    updater = Updater(TELEGRAM_TOKEN, use_context=True)
-    dp = updater.dispatcher
-
-    # Регистрируем обработчики
-    dp.add_handler(CommandHandler("start", start_handler))
-    dp.add_handler(CommandHandler("help", help_handler))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, text_handler))
-
-    # Запускаем
-    updater.start_polling()
-    logger.info("Бот запущен, ожидаю сообщений...")
-    updater.idle()
-
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    data = request.get_json(force=True)
+    update = Update.de_json(data, bot)
+    dispatcher.process_update(update)
+    return "OK", 200
 
 if __name__ == "__main__":
-    main()
+    init_db()
+    # Устанавливаем webhook в Telegram
+    bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
+    # Запускаем Flask
+    app.run(host="0.0.0.0", port=PORT)

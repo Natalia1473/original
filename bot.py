@@ -1,15 +1,18 @@
 import logging
 import sqlite3
 from datetime import datetime
+import os
 
 from difflib import SequenceMatcher
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
-# --------------- НАСТРОЙКИ ---------------
-TELEGRAM_TOKEN = "ВАШ_TELEGRAM_BOT_TOKEN"  # <- замените на токен вашего бота
+# --------------- ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---------------
+load_dotenv()  # ищет .env в текущей папке
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DB_PATH = "submissions.db"
-SIMILARITY_THRESHOLD = 0.7  # порог, выше которого считаем «похожим» (70%)
+SIMILARITY_THRESHOLD = 0.7  # 70%
 
 # ------------- ЛОГИРОВАНИЕ --------------
 logging.basicConfig(
@@ -120,7 +123,7 @@ def text_handler(update: Update, context: CallbackContext):
             "Твоя работа будет сохранена."
         )
     else:
-        reply = "✅ Похоже, что работа оригинальная (нет явных совпадений). Сохраняю её."
+        reply = "✅ Похоже, что работа оригинальна (нет явных совпадений). Сохраняю её."
 
     # Отправляем ответ и сохраняем новую работу
     update.message.reply_text(reply)
@@ -131,6 +134,11 @@ def text_handler(update: Update, context: CallbackContext):
 def main():
     # Инициализируем базу
     init_db()
+
+    # Убедимся, что токен взялся
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_TOKEN не найден в окружении!")
+        return
 
     # Создаём бота
     updater = Updater(TELEGRAM_TOKEN, use_context=True)

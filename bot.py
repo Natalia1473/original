@@ -9,19 +9,22 @@ from telegram import Update, Bot
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
 from flask import Flask, request
 
-load_dotenv()
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # без слэша в конце, например: https://mybot.onrender.com
-PORT = int(os.getenv("PORT", "8443"))
-DB_PATH = "submissions.db"
-SIMILARITY_THRESHOLD = 0.7
+# --------------- ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---------------
+load_dotenv()  # ожидает .env в корне проекта
+TOKEN = os.getenv("TELEGRAM_TOKEN")        # токен бота
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")     # HTTPS URL вашего сервиса без слэша в конце, например https://mybot.onrender.com
+PORT = int(os.getenv("PORT", "8443"))      # порт, на котором будет слушать Flask
+DB_PATH = "submissions.db"                 # файл базы данных SQLite
+SIMILARITY_THRESHOLD = 0.7                 # порог похожести (0.7 = 70%)
 
+# ------------- ЛОГИРОВАНИЕ --------------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# ------------- ФУНКЦИИ РАБОТЫ С БАЗОЙ -------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
@@ -52,6 +55,10 @@ def fetch_all_submissions():
     return rows
 
 def calculate_max_similarity(new_text: str):
+    """
+    Возвращает (max_ratio, id_похожей_записи, username_похожей_записи).
+    Если записей нет, вернет (0.0, None, None).
+    """
     submissions = fetch_all_submissions()
     best_ratio, best_id, best_user = 0.0, None, None
     for rec_id, rec_user_id, rec_username, rec_text, rec_ts in submissions:
@@ -62,13 +69,15 @@ def calculate_max_similarity(new_text: str):
             best_user = rec_username or str(rec_user_id)
     return best_ratio, best_id, best_user
 
+# ------------- ОБРАБОТЧИКИ СООБЩЕНИЙ -------------
 def start(update: Update, context):
     update.message.reply_text(
-        "Привет! Я бот для проверки оригинальности. Отправь текст работы."
+        "Привет! Я бот для проверки оригинальности работ.\n"
+        "Отправь текст работы — я проверю её на схожесть с ранее присланными."
     )
 
 def help_cmd(update: Update, context):
-    update.message.reply_text("/start   /help")
+    update.message.reply_text("/start — показать приветствие\n/help — показать справку")
 
 def check_text(update: Update, context):
     user = update.effective_user
@@ -76,27 +85,36 @@ def check_text(update: Update, context):
     if not text:
         update.message.reply_text("Пустой текст не принимаю.")
         return
+
     ratio, matched_id, matched_user = calculate_max_similarity(text)
     if matched_id and ratio >= SIMILARITY_THRESHOLD:
         perc = round(ratio * 100, 1)
         reply = (
             f"⚠ Похожесть: {perc}%\n"
-            f"Ближайшая работа: @{matched_user}\n"
-            "Твоя работа будет сохранена."
+            f"Найдена похожая работа пользователя @{matched_user}.\n"
+            "Если ты не списывал(а), просто проигнорируй сообщение.\n"
+            "Твоя работа сохранена."
         )
     else:
-        reply = "✅ Оригинально. Сохраняю."
+        reply = "✅ Похоже, что работа оригинальная. Сохраняю."
+
     update.message.reply_text(reply)
     save_submission(user.id, user.username or "", text)
 
-# Flask-приложение для webhook
+# ------------- НАСТРОЙКА BOT и DISPATCHER -------------
 app = Flask(__name__)
 bot = Bot(token=TOKEN)
-dispatcher = Dispatcher(bot, None, workers=0)
+# Dispatcher с минимум 1 воркером (например, 4), чтобы не было warning
+dispatcher = Dispatcher(bot, None, workers=4, use_context=True)
 
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CommandHandler("help", help_cmd))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, check_text))
+
+# ------------- ROUTES ДЛЯ FLASK -------------
+@app.route("/", methods=["GET"])
+def root():
+    return "Bot is running", 200
 
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
@@ -105,9 +123,13 @@ def webhook():
     dispatcher.process_update(update)
     return "OK", 200
 
+# ------------- ЗАПУСК -------------
 if __name__ == "__main__":
     init_db()
-    # Устанавливаем webhook в Telegram
+    if not TOKEN or not WEBHOOK_URL:
+        logger.error("TELEGRAM_TOKEN или WEBHOOK_URL не заданы в окружении!")
+        exit(1)
+    # Устанавливаем webhook
     bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
     # Запускаем Flask
     app.run(host="0.0.0.0", port=PORT)

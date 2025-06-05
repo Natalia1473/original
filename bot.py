@@ -12,7 +12,7 @@ from flask import Flask, request
 from docx import Document  # pip install python-docx
 
 # --------------- ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---------------
-load_dotenv()  # ищет .env в корне
+load_dotenv()  # ищет .env в корне проекта
 TOKEN = os.getenv("TELEGRAM_TOKEN")         # токен бота
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")      # без слэша в конце, например https://mybot.onrender.com
 PORT = int(os.getenv("PORT", "8443"))       # порт для Flask
@@ -21,7 +21,7 @@ SIMILARITY_THRESHOLD = 0.7                  # порог похожести (0.7
 
 # ------------- ЛОГИРОВАНИЕ --------------
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 # ------------- ФУНКЦИИ РАБОТЫ С БАЗОЙ -------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS submissions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -37,7 +38,8 @@ def init_db():
             text TEXT NOT NULL,
             ts TEXT NOT NULL
         )
-    """)
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -71,7 +73,7 @@ def calculate_max_similarity(new_text: str):
             best_user = rec_username or str(rec_user_id)
     return best_ratio, best_id, best_user
 
-# ------------- ФУНКЦИИ ДЛЯ ЧТЕНИЯ DOCX -------------
+# ------------- ФУНКЦИЯ ДЛЯ ЧТЕНИЯ .docx -------------
 def extract_text_from_docx(path: str) -> str:
     doc = Document(path)
     paragraphs = [p.text for p in doc.paragraphs if p.text]
@@ -81,11 +83,15 @@ def extract_text_from_docx(path: str) -> str:
 def start(update: Update, context):
     update.message.reply_text(
         "Привет! Я бот для проверки оригинальности работ.\n"
-        "Можно отправить текст как сообщение или загрузить .docx файл."
+        "Можно отправить текст как сообщение или загрузить .docx-файл."
     )
 
 def help_cmd(update: Update, context):
-    update.message.reply_text("/start — показать приветствие\n/help — показать справку")
+    update.message.reply_text(
+        "/start — приветствие\n"
+        "/help — справка\n\n"
+        "Отправь текст или загрузите .docx."
+    )
 
 def check_text(update: Update, context):
     user = update.effective_user
@@ -100,8 +106,8 @@ def check_text(update: Update, context):
         reply = (
             f"⚠ Похожесть: {perc}%\n"
             f"Найдена похожая работа пользователя @{matched_user}.\n"
-            "Если ты не списывал(а), просто проигнорируй сообщение.\n"
-            "Твоя работа сохранена."
+            "Если ты не списывал(а), просто проигнорируй.\n"
+            "Работа сохранена."
         )
     else:
         reply = "✅ Похоже, что работа оригинальная. Сохраняю."
@@ -117,27 +123,27 @@ def handle_document(update: Update, context):
         update.message.reply_text("Поддерживаются только файлы .docx")
         return
 
-    # Скачиваем файл во временный каталог
+    # Скачиваем в временный файл
     file_id = doc.file_id
     new_file = context.bot.get_file(file_id)
     with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
         temp_path = tf.name
         new_file.download(custom_path=temp_path)
 
-    # Извлекаем текст
     try:
         text = extract_text_from_docx(temp_path)
     except Exception as e:
-        update.message.reply_text("Не смог прочитать .docx файл.")
-        return
-    finally:
+        logger.error(f"Ошибка чтения DOCX: {e}")
+        update.message.reply_text("Не смог прочитать .docx-файл.")
         os.remove(temp_path)
+        return
+
+    os.remove(temp_path)
 
     if not text.strip():
         update.message.reply_text("Файл пустой или не содержит текста.")
         return
 
-    # Проверяем похожесть
     ratio, matched_id, matched_user = calculate_max_similarity(text)
     if matched_id and ratio >= SIMILARITY_THRESHOLD:
         perc = round(ratio * 100, 1)
@@ -179,7 +185,7 @@ def webhook():
 if __name__ == "__main__":
     init_db()
     if not TOKEN or not WEBHOOK_URL:
-        logger.error("TELEGRAM_TOKEN или WEBHOOK_URL не заданы!")
+        logger.error("TELEGRAM_TOKEN или WEBHOOK_URL не заданы в окружении!")
         exit(1)
     bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
     app.run(host="0.0.0.0", port=PORT)

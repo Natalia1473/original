@@ -342,9 +342,10 @@ def handle_document(update: Update, context):
     try:
         internet_score = check_internet_plagiarism(raw_text)
     except Exception as e:
-        logger.error(f"Ошибка при проверке в Copyleaks: {e}")
-        update.message.reply_text("Произошла ошибка при проверке в Copyleaks.")
-        return
+    err_msg = str(e)
+    logger.error(f"Ошибка Copyleaks: {err_msg}")
+    update.message.reply_text("❌ Не удалось проверить через Copyleaks:\n" + err_msg)
+    return
 
     # 5) Формируем ответ по интернет-результату
     if internet_score >= INTERNET_SIMILARITY_THRESHOLD:

@@ -107,7 +107,10 @@ def extract_text_from_docx(path: str) -> str:
 # --------------------------------------------
 def get_copyleaks_token() -> str:
     url = "https://id.copyleaks.com/v3/account/login/api"
-    data = {"email": COPYLEAKS_EMAIL, "apiKey": COPYLEAKS_API_KEY}
+    data = {
+        "email": COPYLEAKS_EMAIL,
+        "key": COPYLEAKS_API_KEY
+    }
     headers = {"Content-Type": "application/json"}
     resp = requests.post(url, json=data, headers=headers)
     if resp.status_code != 200:

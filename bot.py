@@ -131,13 +131,17 @@ def submit_to_copyleaks(access_token: str, content: str) -> str:
     # Кодируем текст в base64
     b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
 
-    # Формируем URL
+    # Формируем URL для отправки файла
     url = f"https://api.copyleaks.com/v3/scans/submit/file/{scan_id}"
-    # Создаем минимальный payload: только base64 и filename
+    # Формируем payload с обязательными полями
     payload = {
         "base64": b64,
         "filename": "submission.txt",
-        "properties": {"sandbox": False, "startScan": True, "webhooks": []}
+        "properties": {
+            "sandbox": False,
+            "startScan": True,
+            "webhooks": []
+        }
     }
     headers = {
         "Content-Type": "application/json",
@@ -150,8 +154,8 @@ def submit_to_copyleaks(access_token: str, content: str) -> str:
         raise RuntimeError(f"Copyleaks submit: {resp.status_code} {resp.text}")
     return scan_id
 
-
-def poll_copyleaks_result(access_token: str, scan_id: str) -> dict:
+# --------------------------------------------
+def poll_copyleaks_result(access_token: str, scan_id: str) -> dict:(access_token: str, scan_id: str) -> dict:
     url = f"https://api.copyleaks.com/v3/scans/{scan_id}/status"
     headers = {"Authorization": f"Bearer {access_token}"}
     while True:

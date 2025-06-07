@@ -4,6 +4,8 @@ import sqlite3
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
+import base64
+import uuid
 from datetime import datetime
 from difflib import SequenceMatcher
 
@@ -26,7 +28,7 @@ COPYLEAKS_API_KEY = os.getenv("COPYLEAKS_API_KEY")
 
 DB_PATH = "submissions.db"
 LOCAL_SIMILARITY_THRESHOLD = 0.7
-INTERNET_SIMILARITY_THRESHOLD = 20.0  # процент
+INTERNET_SIMILARITY_THRESHOLD = 20.0  # процент совпадений
 
 # --------------------------------------------
 #  Логирование
@@ -51,7 +53,8 @@ def init_db():
             ts TEXT NOT NULL,
             internet_score REAL
         )
-    """)
+    """
+    )
     conn.commit()
     conn.close()
 
@@ -73,7 +76,8 @@ def fetch_all_submissions():
 def calculate_max_similarity_locally(new_text: str):
     submissions = fetch_all_submissions()
     best_ratio, best_id, best_user = 0.0, None, None
-    for rec_id, rec_user_id, rec_username, rec_text, rec_ts, rec_score in submissions:
+    for rec in submissions:
+        rec_id, rec_user_id, rec_username, rec_text, rec_ts, rec_score = rec
         ratio = SequenceMatcher(None, new_text, rec_text).ratio()
         if ratio > best_ratio:
             best_ratio = ratio
@@ -94,10 +98,7 @@ def extract_text_from_docx(path: str) -> str:
     try:
         namespace = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
         root = ET.fromstring(xml_content)
-        texts = []
-        for node in root.findall('.//w:t', namespace):
-            if node.text:
-                texts.append(node.text)
+        texts = [node.text for node in root.findall('.//w:t', namespace) if node.text]
         return "\n".join(texts)
     except Exception as e:
         raise RuntimeError(f"Ошибка при разборе XML document.xml: {e}")
@@ -107,10 +108,7 @@ def extract_text_from_docx(path: str) -> str:
 # --------------------------------------------
 def get_copyleaks_token() -> str:
     url = "https://id.copyleaks.com/v3/account/login/api"
-    data = {
-        "email": COPYLEAKS_EMAIL,
-        "key": COPYLEAKS_API_KEY
-    }
+    data = {"email": COPYLEAKS_EMAIL, "key": COPYLEAKS_API_KEY}
     headers = {"Content-Type": "application/json"}
     resp = requests.post(url, json=data, headers=headers)
     if resp.status_code != 200:
@@ -121,25 +119,27 @@ def get_copyleaks_token() -> str:
         raise RuntimeError("В ответе Copyleaks не найден access_token")
     return token
 
+
 def submit_to_copyleaks(access_token: str, content: str) -> str:
-    url = "https://api.copyleaks.com/v3/scans/submit/text"
+    # Генерируем уникальный scan_id
+    scan_id = str(uuid.uuid4())
+
+    # Кодируем текст в base64
+    b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+
+    url = f"https://api.copyleaks.com/v3/scans/submit/file/{scan_id}"
     payload = {
-        "base64": False,
-        "properties": {"sandbox": False, "startScan": True, "webhooks": []},
-        "content": content,
-        "metadata": {"filename": "telegram_submission.txt", "title": "Telegram Bot Submission"},
-        "options": {"language": "ru"}
+        "base64": b64,
+        "filename": "submission.txt",
+        "properties": {"sandbox": False, "startScan": True, "webhooks": []}
     }
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"}
-    resp = requests.post(url, json=payload, headers=headers)
+    resp = requests.put(url, json=payload, headers=headers)
     if resp.status_code not in (200, 201):
         logger.error(f"Copyleaks submit failed: {resp.status_code} {resp.text}")
         raise RuntimeError(f"Copyleaks submit: {resp.status_code} {resp.text}")
-    resp_json = resp.json()
-    scan_id = resp_json.get("scan")
-    if not scan_id:
-        raise RuntimeError(f"Copyleaks-submit вернул некорректный ответ: {resp_json}")
     return scan_id
+
 
 def poll_copyleaks_result(access_token: str, scan_id: str) -> dict:
     url = f"https://api.copyleaks.com/v3/scans/{scan_id}/status"
@@ -155,8 +155,8 @@ def poll_copyleaks_result(access_token: str, scan_id: str) -> dict:
             return data
         if status == "failed":
             raise RuntimeError("Copyleaks scan failed (status=failed)")
-        import time
-        time.sleep(2)
+        import time; time.sleep(2)
+
 
 def get_copyleaks_report(access_token: str, scan_id: str) -> dict:
     url = f"https://api.copyleaks.com/v3/scans/{scan_id}/results"
@@ -167,14 +167,13 @@ def get_copyleaks_report(access_token: str, scan_id: str) -> dict:
         raise RuntimeError(f"Copyleaks report: {resp.status_code} {resp.text}")
     return resp.json()
 
+
 def check_internet_plagiarism(text: str) -> float:
     access_token = get_copyleaks_token()
     scan_id = submit_to_copyleaks(access_token, text)
     poll_copyleaks_result(access_token, scan_id)
     report = get_copyleaks_report(access_token, scan_id)
-    summary = report.get("summary", {})
-    overall_score = summary.get("percentage", 0.0)
-    return overall_score
+    return report.get("summary", {}).get("percentage", 0.0)
 
 # --------------------------------------------
 #  Обработчики Telegram-сообщений
@@ -185,12 +184,14 @@ def start(update: Update, context):
         "Отправь текст или загрузи .docx — проверю по интернету через Copyleaks."
     )
 
+
 def help_cmd(update: Update, context):
     update.message.reply_text(
         "/start — приветствие\n"
         "/help — справка\n\n"
         "Можно отправлять текст или .docx-файлы."
     )
+
 
 def check_text(update: Update, context):
     user = update.effective_user
@@ -225,6 +226,7 @@ def check_text(update: Update, context):
         update.message.reply_text(f"✅ В интернете только {internet_score:.1f}% совпадений. Оригинально.")
 
     save_submission(user.id, user.username or "", raw_text, internet_score)
+
 
 def handle_document(update: Update, context):
     user = update.effective_user

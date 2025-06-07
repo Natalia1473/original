@@ -121,14 +121,29 @@ def get_copyleaks_token() -> str:
 def submit_to_copyleaks(access_token: str, content: str) -> str:
     scan_id = str(uuid.uuid4())
     b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-    url = f"https://api.copyleaks.com/v3/scans/submit/file/{scan_id}"
     payload = {
         "base64": b64,
         "filename": "submission.txt",
-        "properties": {"sandbox": False, "startScan": True, "webhooks": []}
+        "properties": {
+            "sandbox": False,
+            "startScan": True,
+            "webhooks": []
+        }
     }
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"}
-    resp = requests.put(url, json=payload, headers=headers)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {access_token}"
+    }
+
+    # --- DEBUG: залогируем payload перед отправкой ---
+    logger.info(f"Submitting to Copyleaks scan_id={scan_id} payload keys={list(payload.keys())}")
+    # -----------------------------------------------
+
+    resp = requests.put(
+        f"https://api.copyleaks.com/v3/scans/submit/file/{scan_id}",
+        json=payload,
+        headers=headers
+    )
     if resp.status_code not in (200, 201):
         logger.error(f"Copyleaks submit failed: {resp.status_code} {resp.text}")
         raise RuntimeError(f"Copyleaks submit: {resp.status_code} {resp.text}")

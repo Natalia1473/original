@@ -4,12 +4,13 @@ import sqlite3
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
-import base64
 import uuid
 from datetime import datetime
 from difflib import SequenceMatcher
 
-import requests
+from copyleaks import Copyleaks
+from copyleaks.models.scan_properties import ScanProperties, Webhooks
+from copyleaks.models.source import SourceText
 from dotenv import load_dotenv
 from flask import Flask, request
 from telegram import Bot, Update
@@ -40,7 +41,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------
-#  Работа с локальной БД
+#  Локальная БД (SQLite)
 # --------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -53,9 +54,11 @@ def init_db():
             ts TEXT NOT NULL,
             internet_score REAL
         )
-    """)
+    """
+    )
     conn.commit()
     conn.close()
+
 
 def save_submission(user_id: int, username: str, text: str, internet_score: float):
     conn = sqlite3.connect(DB_PATH)
@@ -66,227 +69,155 @@ def save_submission(user_id: int, username: str, text: str, internet_score: floa
     conn.commit()
     conn.close()
 
-def fetch_all_submissions():
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT id, user_id, username, text, ts, internet_score FROM submissions"
-    ).fetchall()
-    conn.close()
-    return rows
 
 def calculate_max_similarity_locally(new_text: str):
-    submissions = fetch_all_submissions()
-    best_ratio, best_id, best_user = 0.0, None, None
-    for rec_id, rec_user_id, rec_username, rec_text, rec_ts, rec_score in submissions:
-        ratio = SequenceMatcher(None, new_text, rec_text).ratio()
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT user_id, username, text FROM submissions"
+    ).fetchall()
+    conn.close()
+    best_ratio, best_user = 0.0, None
+    for user_id, username, old_text in rows:
+        ratio = SequenceMatcher(None, new_text, old_text).ratio()
         if ratio > best_ratio:
-            best_ratio, best_id, best_user = ratio, rec_id, rec_username or str(rec_user_id)
-    return best_ratio, best_id, best_user
+            best_ratio = ratio
+            best_user = username or str(user_id)
+    return best_ratio, best_user
 
 # --------------------------------------------
 #  Извлечение текста из .docx
 # --------------------------------------------
 def extract_text_from_docx(path: str) -> str:
-    try:
-        with zipfile.ZipFile(path, 'r') as z:
-            xml_content = z.read('word/document.xml')
-    except Exception as e:
-        raise RuntimeError(f"Ошибка при открытии DOCX как ZIP: {e}")
-
-    try:
-        namespace = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
-        root = ET.fromstring(xml_content)
-        texts = [node.text for node in root.findall('.//w:t', namespace) if node.text]
-        return "\n".join(texts)
-    except Exception as e:
-        raise RuntimeError(f"Ошибка при разборе XML document.xml: {e}")
+    with zipfile.ZipFile(path, 'r') as z:
+        xml_content = z.read('word/document.xml')
+    namespace = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+    root = ET.fromstring(xml_content)
+    texts = [node.text for node in root.findall('.//w:t', namespace) if node.text]
+    return "\n".join(texts)
 
 # --------------------------------------------
-#  Copyleaks API
+#  Copyleaks SDK
 # --------------------------------------------
-def get_copyleaks_token() -> str:
-    url = "https://id.copyleaks.com/v3/account/login/api"
-    data = {"email": COPYLEAKS_EMAIL, "key": COPYLEAKS_API_KEY}
-    headers = {"Content-Type": "application/json"}
-    resp = requests.post(url, json=data, headers=headers)
-    if resp.status_code != 200:
-        logger.error(f"Copyleaks login failed: {resp.status_code} {resp.text}")
-        raise RuntimeError(f"Copyleaks login: {resp.status_code} {resp.text}")
-    token = resp.json().get("access_token")
-    if not token:
-        raise RuntimeError("В ответе Copyleaks не найден access_token")
-    return token
+# Инициализация SDK и логин
+copyleaks = Copyleaks()
+login = copyleaks.login(COPYLEAKS_EMAIL, COPYLEAKS_API_KEY)
+access_token = login.access_token
 
-def submit_to_copyleaks(access_token: str, content: str) -> str:
-    scan_id = str(uuid.uuid4())
-    b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-    payload = {
-        "base64": b64,
-        "filename": "submission.txt",
-        "properties": {"sandbox": False, "startScan": True, "webhooks": []}
-    }
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"}
-    logger.info(f"Submitting to Copyleaks, scan_id={scan_id}, payload keys={list(payload.keys())}")
-    resp = requests.put(
-        f"https://api.copyleaks.com/v3/scans/submit/file/{scan_id}",
-        json=payload,
-        headers=headers
-    )
-    if resp.status_code not in (200, 201):
-        logger.error(f"Copyleaks submit failed: {resp.status_code} {resp.text}")
-        raise RuntimeError(f"Copyleaks submit: {resp.status_code} {resp.text}")
-    return scan_id
-
-def poll_copyleaks_result(access_token: str, scan_id: str) -> dict:
-    """
-    Опрашивает статус сканирования до завершения.
-    """
-    url = f"https://api.copyleaks.com/v3/scans/{scan_id}/status"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    while True:
-        resp = requests.get(url, headers=headers)
-        if resp.status_code != 200:
-            logger.error(f"Copyleaks status failed: {resp.status_code} {resp.text}")
-            raise RuntimeError(f"Copyleaks status: {resp.status_code} {resp.text}")
-        data = resp.json()
-        status = data.get("status")
-        if status == "completed":
-            return data
-        if status == "failed":
-            raise RuntimeError("Copyleaks scan failed (status=failed)")
-        import time
-        time.sleep(2)
-
-def get_copyleaks_report(access_token: str, scan_id: str) -> dict:
-    url = f"https://api.copyleaks.com/v3/scans/{scan_id}/results"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    resp = requests.get(url, headers=headers)
-    if resp.status_code != 200:
-        logger.error(f"Copyleaks report failed: {resp.status_code} {resp.text}")
-        raise RuntimeError(f"Copyleaks report: {resp.status_code} {resp.text}")
-    return resp.json()
 
 def check_internet_plagiarism(text: str) -> float:
-    access_token = get_copyleaks_token()
-    scan_id = submit_to_copyleaks(access_token, text)
-    poll_copyleaks_result(access_token, scan_id)
-    report = get_copyleaks_report(access_token, scan_id)
-    return report.get("summary", {}).get("percentage", 0.0)
+    """
+    Проверяет текст через Copyleaks и возвращает % совпадений.
+    """
+    scan_id = str(uuid.uuid4())
+    props = ScanProperties(
+        sandbox=False,
+        start_scan=True,
+        webhooks=Webhooks(status=[])
+    )
+    source = SourceText(content=text, filename="submission.txt")
+    copyleaks.create_scan_by_text(
+        token=access_token,
+        scan_id=scan_id,
+        properties=props,
+        source=source
+    )
+    # SDK ждёт завершения и получает результаты
+    report = copyleaks.get_scan_results(token=access_token, scan_id=scan_id)
+    return report.summary.percentage
 
 # --------------------------------------------
 #  Обработчики Telegram
 # --------------------------------------------
 def start(update: Update, context):
     update.message.reply_text(
-        "Привет! Я бот для проверки оригинальности работ.\n"
-        "Отправь текст или .docx — проверю по интернету через Copyleaks."
+        "Привет! Я проверяю оригинальность работ через Copyleaks. "
+        "Отправь текст или .docx."
     )
 
+
 def help_cmd(update: Update, context):
-    update.message.reply_text("/start — приветствие\n/help — справка")
+    update.message.reply_text(
+        "/start — приветствие\n"
+        "/help — справка"
+    )
+
 
 def check_text(update: Update, context):
-    user = update.effective_user
     raw_text = update.message.text.strip()
     if not raw_text:
         update.message.reply_text("Пустого текста не принимаю.")
         return
-
-    lr, lid, luser = calculate_max_similarity_locally(raw_text)
-    if lid and lr >= LOCAL_SIMILARITY_THRESHOLD:
-        update.message.reply_text(f"⚠ Локальное совпадение: {lr*100:.1f}% с @{luser}.\nПроверяю по интернету...")
-    else:
-        update.message.reply_text("Локальных совпадений нет. Проверяю по интернету...")
-
+    # Локальная проверка
+    ratio, user = calculate_max_similarity_locally(raw_text)
+    if ratio >= LOCAL_SIMILARITY_THRESHOLD:
+        update.message.reply_text(f"⚠ Локальное совпадение: {ratio*100:.1f}% с @{user}")
+    update.message.reply_text("Проверяю по интернету...")
     try:
         internet_score = check_internet_plagiarism(raw_text)
     except Exception as e:
-        err = str(e)
-        logger.error(f"Copyleaks error in check_text: {err}")
-        update.message.reply_text(f"❌ Не удалось проверить через Copyleaks:\n{err}")
+        update.message.reply_text(f"Ошибка Copyleaks: {e}")
         return
-
     if internet_score >= INTERNET_SIMILARITY_THRESHOLD:
-        update.message.reply_text(f"❌ В интернете найдено {internet_score:.1f}% совпадений.")
-    else:
-        update.message.reply_text(f"✅ В интернете только {internet_score:.1f}% совпадений. Оригинально.")
-
-    save_submission(user.id, user.username or "", raw_text, internet_score)
-
-def handle_document(update: Update, context):
-    user = update.effective_user
-    doc = update.message.document
-    if not doc.file_name.lower().endswith(".docx"):
-        update.message.reply_text("Поддерживаются только .docx")
-        return
-
-    new_file = context.bot.get_file(doc.file_id)
-    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
-        path = tf.name
-        new_file.download(custom_path=path)
-
-    try:
-        raw_text = extract_text_from_docx(path)
-    except Exception as e:
-        err = str(e)
-        logger.error(f"DOCX read error: {err}")
-        update.message.reply_text(f"❌ Не удалось извлечь текст: {err}")
-        os.remove(path)
-        return
-
-    os.remove(path)
-    if not raw_text.strip():
-        update.message.reply_text("Файл пустой.")
-        return
-
-    lr, lid, luser = calculate_max_similarity_locally(raw_text)
-    if lid and lr >= LOCAL_SIMILARITY_THRESHOLD:
-        update.message.reply_text(f"⚠ Локал: {lr*100:.1f}% с @{luser}.\nПроверяю по интернету...")
-    else:
-        update.message.reply_text("Локальных совпадений нет. Проверяю по интернету...")
-
-    try:
-        internet_score = check_internet_plagiarism(raw_text)
-    except Exception as e:
-        err = str(e)
-        logger.error(f"Copyleaks error in handle_document: {err}")
-        update.message.reply_text(f"❌ Ошибка при проверке: {err}")
-        return
-
-    if internet_score >= INTERNET_SIMILARITY_THRESHOLD:
-        update.message.reply_text(f"❌ В интернете найдено {internet_score:.1f}% совпадений.")
+        update.message.reply_text(f"❌ Найдено {internet_score:.1f}% совпадений в интернете.")
     else:
         update.message.reply_text(f"✅ В интернете только {internet_score:.1f}% совпадений.")
+    save_submission(update.effective_user.id, update.effective_user.username or "", raw_text, internet_score)
 
-    save_submission(user.id, user.username or "", raw_text, internet_score)
+
+def handle_document(update: Update, context):
+    doc = update.message.document
+    if not doc.file_name.lower().endswith('.docx'):
+        update.message.reply_text("Только .docx")
+        return
+    new_file = context.bot.get_file(doc.file_id)
+    with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tf:
+        path = tf.name
+        new_file.download(custom_path=path)
+    raw_text = extract_text_from_docx(path)
+    os.remove(path)
+    # Локальная проверка
+    ratio, user = calculate_max_similarity_locally(raw_text)
+    if ratio >= LOCAL_SIMILARITY_THRESHOLD:
+        update.message.reply_text(f"⚠ Локальное совпадение: {ratio*100:.1f}% с @{user}")
+    update.message.reply_text("Проверяю по интернету...")
+    try:
+        internet_score = check_internet_plagiarism(raw_text)
+    except Exception as e:
+        update.message.reply_text(f"Ошибка Copyleaks: {e}")
+        return
+    if internet_score >= INTERNET_SIMILARITY_THRESHOLD:
+        update.message.reply_text(f"❌ Найдено {internet_score:.1f}% совпадений в интернете.")
+    else:
+        update.message.reply_text(f"✅ В интернете только {internet_score:.1f}% совпадений.")
+    save_submission(update.effective_user.id, update.effective_user.username or "", raw_text, internet_score)
 
 # --------------------------------------------
-#  Flask + webhook
+#  Flask + Webhook
 # --------------------------------------------
 app = Flask(__name__)
 bot = Bot(token=TOKEN)
 dispatcher = Dispatcher(bot, None, workers=4, use_context=True)
 
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("help", help_cmd))
+dispatcher.add_handler(CommandHandler('start', start))
+dispatcher.add_handler(CommandHandler('help', help_cmd))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, check_text))
 dispatcher.add_handler(MessageHandler(Filters.document, handle_document))
 
-@app.route("/", methods=["GET"])
+@app.route('/', methods=['GET'])
 def root():
-    return "Bot is running", 200
+    return 'Bot is running', 200
 
-@app.route(f"/{TOKEN}", methods=["POST"])
+@app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
     data = request.get_json(force=True)
     update = Update.de_json(data, bot)
     dispatcher.process_update(update)
-    return "OK", 200
+    return 'OK', 200
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     init_db()
-    if not TOKEN or not WEBHOOK_URL or not COPYLEAKS_EMAIL or not COPYLEAKS_API_KEY:
-        logger.error("Не заданы необходимые переменные!")
+    if not all([TOKEN, WEBHOOK_URL, COPYLEAKS_EMAIL, COPYLEAKS_API_KEY]):
+        logger.error('Не заданы все переменные окружения')
         exit(1)
     bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(host='0.0.0.0', port=PORT)

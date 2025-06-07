@@ -136,7 +136,8 @@ def submit_to_copyleaks(access_token: str, content: str) -> str:
     # Создаем минимальный payload: только base64 и filename
     payload = {
         "base64": b64,
-        "filename": "submission.txt"
+        "filename": "submission.txt",
+        "properties": {"sandbox": False, "startScan": True, "webhooks": []}
     }
     headers = {
         "Content-Type": "application/json",

@@ -121,19 +121,28 @@ def get_copyleaks_token() -> str:
 
 
 def submit_to_copyleaks(access_token: str, content: str) -> str:
+    """
+    Отправляем свободный текст на проверку через endpoint Submit by file.
+    Возвращаем scan_id.
+    """
     # Генерируем уникальный scan_id
     scan_id = str(uuid.uuid4())
 
     # Кодируем текст в base64
     b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
 
+    # Формируем URL
     url = f"https://api.copyleaks.com/v3/scans/submit/file/{scan_id}"
+    # Создаем минимальный payload: только base64 и filename
     payload = {
         "base64": b64,
-        "filename": "submission.txt",
-        "properties": {"sandbox": False, "startScan": True, "webhooks": []}
+        "filename": "submission.txt"
     }
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {access_token}"
+    }
+    # Отправляем PUT-запрос
     resp = requests.put(url, json=payload, headers=headers)
     if resp.status_code not in (200, 201):
         logger.error(f"Copyleaks submit failed: {resp.status_code} {resp.text}")

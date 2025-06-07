@@ -156,3 +156,167 @@ def submit_to_copyleaks(access_token: str, content: str) -> str:
 
 # --------------------------------------------
 def poll_copyleaks_result(access_token: str, scan_id: str) -> dict:
+    """
+    Опрашивает статус сканирования до завершения.
+    """
+    url = f"https://api.copyleaks.com/v3/scans/{scan_id}/status"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    while True:
+        resp = requests.get(url, headers=headers)
+        if resp.status_code != 200:
+            logger.error(f"Copyleaks status failed: {resp.status_code} {resp.text}")
+            raise RuntimeError(f"Copyleaks status: {resp.status_code} {resp.text}")
+        data = resp.json()
+        status = data.get("status")
+        if status == "completed":
+            return data
+        if status == "failed":
+            raise RuntimeError("Copyleaks scan failed (status=failed)")
+                import time
+        time.sleep(2)
+
+# --------------------------------------------
+#  Получение итогового отчёта по сканированию
+# --------------------------------------------
+def get_copyleaks_report(access_token: str, scan_id: str) -> dict:
+    url = f"https://api.copyleaks.com/v3/scans/{scan_id}/results"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    resp = requests.get(url, headers=headers)
+    if resp.status_code != 200:
+        logger.error(f"Copyleaks report failed: {resp.status_code} {resp.text}")
+        raise RuntimeError(f"Copyleaks report: {resp.status_code} {resp.text}")
+    return resp.json()
+
+# --------------------------------------------
+#  Обёртка для получения процента совпадений 
+# --------------------------------------------
+def check_internet_plagiarism(text: str) -> float:
+    access_token = get_copyleaks_token()
+    scan_id = submit_to_copyleaks(access_token, text)
+    poll_copyleaks_result(access_token, scan_id)
+    report = get_copyleaks_report(access_token, scan_id)
+    return report.get("summary", {}).get("percentage", 0.0)
+
+# --------------------------------------------
+#  Обработчики Telegram-сообщений
+# --------------------------------------------
+def start(update: Update, context):
+    update.message.reply_text(
+        "Привет! Я бот для проверки оригинальности работ.\n"
+        "Отправь текст или загрузите .docx — я проверю по интернету через Copyleaks."
+    )
+
+def help_cmd(update: Update, context):
+    update.message.reply_text(
+        "/start — приветствие\n"
+        "/help — справка"
+    )
+
+def check_text(update: Update, context):
+    user = update.effective_user
+    raw_text = update.message.text.strip()
+    if not raw_text:
+        update.message.reply_text("Пустого текста не принимаю.")
+        return
+
+    # Локальная проверка
+    local_ratio, local_id, local_user = calculate_max_similarity_locally(raw_text)
+    if local_id and local_ratio >= LOCAL_SIMILARITY_THRESHOLD:
+        perc_local = round(local_ratio * 100, 1)
+        update.message.reply_text(
+            f"⚠ Локальное совпадение: {perc_local}% с @{local_user}.\n"
+            "Проверяю по интернету..."
+        )
+    else:
+        update.message.reply_text("Локальных совпадений нет. Проверяю по интернету...")
+
+    try:
+        internet_score = check_internet_plagiarism(raw_text)
+    except Exception as e:
+        err_msg = str(e)
+        logger.error(f"Ошибка Copyleaks в check_text: {err_msg}")
+        update.message.reply_text(
+            "❌ Не удалось проверить через Copyleaks:\n" + err_msg
+        )
+        return
+
+    if internet_score >= INTERNET_SIMILARITY_THRESHOLD:
+        update.message.reply_text(f"❌ В интернете найдено {internet_score:.1f}% совпадений.")
+    else:
+        update.message.reply_text(f"✅ В интернете только {internet_score:.1f}% совпадений. Оригинально.")
+
+    save_submission(user.id, user.username or "", raw_text, internet_score)
+
+
+def handle_document(update: Update, context):
+    user = update.effective_user
+    doc = update.message.document
+    if not doc.file_name.lower().endswith(".docx"):
+        update.message.reply_text("Поддерживаются только файлы .docx")
+        return
+
+    file_id = doc.file_id
+    new_file = context.bot.get_file(file_id)
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+        temp_path = tf.name
+        new_file.download(custom_path=temp_path)
+
+    try:
+        raw_text = extract_text_from_docx(temp_path)
+    except Exception as e:
+        err = str(e)
+        logger.error(f"Ошибка чтения DOCX: {err}")
+        update.message.reply_text(f"❌ Не удалось извлечь текст из .docx:\n{err}")
+        os.remove(temp_path)
+        return
+
+    os.remove(temp_path)
+
+    if not raw_text.strip():
+        update.message.reply_text("Файл пустой или не содержит текста.")
+        return
+
+    local_ratio, local_id, local_user = calculate_max_similarity_locally(raw_text)
+    if local_id and local_ratio >= LOCAL_SIMILARITY_THRESHOLD:
+        perc_local = round(local_ratio * 100, 1)
+        update.message.reply_text(
+            f"⚠ Локальное совпадение: {perc_local}% с @{local_user}.\n"
+            "Проверяю по интернету..."
+        )
+    else:
+        update.message.reply_text("Локальных совпадений нет. Проверяю по интернету...")
+
+    try:
+        internet_score = check_internet_plagiarism(raw_text)
+    except Exception as e:
+        err = str(e)
+        logger.error(f"Ошибка Copyleaks в handle_document: {err}")
+        update.message.reply_text(
+            "❌ Не удалось проверить документ через Copyleaks:\n" + err
+        )
+        return
+
+    if internet_score >= INTERNET_SIMILARITY_THRESHOLD:
+        update.message.reply_text(f"❌ В интернете найдено {internet_score:.1f}% совпадений.")
+    else:
+        update.message.reply_text(f"✅ В интернете только {internet_score:.1f}% совпадений. Оригинально.")
+
+    save_submission(user.id, user.username or "", raw_text, internet_score)
+
+# --------------------------------------------
+#  Flask + Telegram Webhook
+# --------------------------------------------
+app = Flask(__name__)
+bot = Bot(token=TOKEN)
+dispatcher = Dispatcher(bot, None, workers=4, use_context=True)
+
+dispatcher.add_handler(CommandHandler("start", start))
+
+dispatcher.add_handler(CommandHandler("help", help_cmd))
+
+dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, check_text))
+
+dispatcher.add_handler(MessageHandler(Filters.document, handle_document))
+
+@app.route("/", methods=["GET"])
+```

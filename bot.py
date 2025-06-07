@@ -53,8 +53,7 @@ def init_db():
             ts TEXT NOT NULL,
             internet_score REAL
         )
-    """
-    )
+    """)
     conn.commit()
     conn.close()
 
@@ -124,21 +123,10 @@ def submit_to_copyleaks(access_token: str, content: str) -> str:
     payload = {
         "base64": b64,
         "filename": "submission.txt",
-        "properties": {
-            "sandbox": False,
-            "startScan": True,
-            "webhooks": []
-        }
+        "properties": {"sandbox": False, "startScan": True, "webhooks": []}
     }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {access_token}"
-    }
-
-    # --- DEBUG: залогируем payload перед отправкой ---
-    logger.info(f"Submitting to Copyleaks scan_id={scan_id} payload keys={list(payload.keys())}")
-    # -----------------------------------------------
-
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"}
+    logger.info(f"Submitting to Copyleaks, scan_id={scan_id}, payload keys={list(payload.keys())}")
     resp = requests.put(
         f"https://api.copyleaks.com/v3/scans/submit/file/{scan_id}",
         json=payload,
@@ -166,7 +154,8 @@ def poll_copyleaks_result(access_token: str, scan_id: str) -> dict:
             return data
         if status == "failed":
             raise RuntimeError("Copyleaks scan failed (status=failed)")
-        import time; time.sleep(2)
+        import time
+        time.sleep(2)
 
 def get_copyleaks_report(access_token: str, scan_id: str) -> dict:
     url = f"https://api.copyleaks.com/v3/scans/{scan_id}/results"
@@ -190,14 +179,11 @@ def check_internet_plagiarism(text: str) -> float:
 def start(update: Update, context):
     update.message.reply_text(
         "Привет! Я бот для проверки оригинальности работ.\n"
-        "Отправь текст или загрузи .docx — проверю по интернету через Copyleaks."
+        "Отправь текст или .docx — проверю по интернету через Copyleaks."
     )
 
 def help_cmd(update: Update, context):
-    update.message.reply_text(
-        "/start — приветствие\n"
-        "/help — справка"
-    )
+    update.message.reply_text("/start — приветствие\n/help — справка")
 
 def check_text(update: Update, context):
     user = update.effective_user
@@ -205,13 +191,13 @@ def check_text(update: Update, context):
     if not raw_text:
         update.message.reply_text("Пустого текста не принимаю.")
         return
-    local_ratio, local_id, local_user = calculate_max_similarity_locally(raw_text)
-    if local_id and local_ratio >= LOCAL_SIMILARITY_THRESHOLD:
-        update.message.reply_text(
-            f"⚠ Локальное совпадение: {round(local_ratio*100,1)}% с @{local_user}.\nПроверяю по интернету..."
-        )
+
+    lr, lid, luser = calculate_max_similarity_locally(raw_text)
+    if lid and lr >= LOCAL_SIMILARITY_THRESHOLD:
+        update.message.reply_text(f"⚠ Локальное совпадение: {lr*100:.1f}% с @{luser}.\nПроверяю по интернету...")
     else:
         update.message.reply_text("Локальных совпадений нет. Проверяю по интернету...")
+
     try:
         internet_score = check_internet_plagiarism(raw_text)
     except Exception as e:
@@ -219,56 +205,63 @@ def check_text(update: Update, context):
         logger.error(f"Copyleaks error in check_text: {err}")
         update.message.reply_text(f"❌ Не удалось проверить через Copyleaks:\n{err}")
         return
+
     if internet_score >= INTERNET_SIMILARITY_THRESHOLD:
         update.message.reply_text(f"❌ В интернете найдено {internet_score:.1f}% совпадений.")
     else:
         update.message.reply_text(f"✅ В интернете только {internet_score:.1f}% совпадений. Оригинально.")
+
     save_submission(user.id, user.username or "", raw_text, internet_score)
 
 def handle_document(update: Update, context):
     user = update.effective_user
     doc = update.message.document
     if not doc.file_name.lower().endswith(".docx"):
-        update.message.reply_text("Поддерживаются только файлы .docx")
+        update.message.reply_text("Поддерживаются только .docx")
         return
+
     new_file = context.bot.get_file(doc.file_id)
     with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
-        temp_path = tf.name
-        new_file.download(custom_path=temp_path)
+        path = tf.name
+        new_file.download(custom_path=path)
+
     try:
-        raw_text = extract_text_from_docx(temp_path)
+        raw_text = extract_text_from_docx(path)
     except Exception as e:
         err = str(e)
         logger.error(f"DOCX read error: {err}")
-        update.message.reply_text(f"❌ Не удалось извлечь текст из .docx:\n{err}")
-        os.remove(temp_path)
+        update.message.reply_text(f"❌ Не удалось извлечь текст: {err}")
+        os.remove(path)
         return
-    os.remove(temp_path)
+
+    os.remove(path)
     if not raw_text.strip():
-        update.message.reply_text("Файл пустой или не содержит текста.")
+        update.message.reply_text("Файл пустой.")
         return
-    local_ratio, local_id, local_user = calculate_max_similarity_locally(raw_text)
-    if local_id and local_ratio >= LOCAL_SIMILARITY_THRESHOLD:
-        update.message.reply_text(
-            f"⚠ Локальное совпадение: {round(local_ratio*100,1)}% с @{local_user}.\nПроверяю по интернету..."
-        )
+
+    lr, lid, luser = calculate_max_similarity_locally(raw_text)
+    if lid and lr >= LOCAL_SIMILARITY_THRESHOLD:
+        update.message.reply_text(f"⚠ Локал: {lr*100:.1f}% с @{luser}.\nПроверяю по интернету...")
     else:
         update.message.reply_text("Локальных совпадений нет. Проверяю по интернету...")
+
     try:
         internet_score = check_internet_plagiarism(raw_text)
     except Exception as e:
         err = str(e)
         logger.error(f"Copyleaks error in handle_document: {err}")
-        update.message.reply_text(f"❌ Не удалось проверить через Copyleaks:\n{err}")
+        update.message.reply_text(f"❌ Ошибка при проверке: {err}")
         return
+
     if internet_score >= INTERNET_SIMILARITY_THRESHOLD:
         update.message.reply_text(f"❌ В интернете найдено {internet_score:.1f}% совпадений.")
     else:
-        update.message.reply_text(f"✅ В интернете только {internet_score:.1f}% совпадений. Оригинально.")
+        update.message.reply_text(f"✅ В интернете только {internet_score:.1f}% совпадений.")
+
     save_submission(user.id, user.username or "", raw_text, internet_score)
 
 # --------------------------------------------
-#  Настройка Flask и запуск
+#  Flask + webhook
 # --------------------------------------------
 app = Flask(__name__)
 bot = Bot(token=TOKEN)
@@ -293,7 +286,7 @@ def webhook():
 if __name__ == "__main__":
     init_db()
     if not TOKEN or not WEBHOOK_URL or not COPYLEAKS_EMAIL or not COPYLEAKS_API_KEY:
-        logger.error("TELEGRAM_TOKEN, WEBHOOK_URL, COPYLEAKS_EMAIL или COPYLEAKS_API_KEY не заданы!")
+        logger.error("Не заданы необходимые переменные!")
         exit(1)
     bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
     app.run(host="0.0.0.0", port=PORT)
